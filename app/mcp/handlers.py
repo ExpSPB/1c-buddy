@@ -66,6 +66,7 @@ class McpHandlers:
     def _extract_tool_text(
         self, result: Dict[str, Any], *, include_tool_details: bool = False
     ) -> str:
+        full_text = (result.get("full_text") or "").strip()
         followups = [
             item.get("text", "").strip()
             for item in result.get("tool_followups", [])
@@ -83,13 +84,18 @@ class McpHandlers:
             if include_tool_details and details:
                 blocks.extend(str(detail) for detail in details if detail)
 
-        if followups:
+        if full_text:
+            blocks.append(full_text)
+        elif followups:
             blocks.append(followups[-1])
         elif final_text:
             blocks.append(final_text)
         return "\n".join(part for part in blocks if part).strip()
 
     def _extract_task_text(self, result: Dict[str, Any]) -> str:
+        full_text = (result.get("full_text") or "").strip()
+        if full_text:
+            return full_text
         final_text = (result.get("final_text") or "").strip()
         if final_text:
             return final_text
@@ -101,6 +107,9 @@ class McpHandlers:
         return followups[-1] if followups else ""
 
     def _extract_standard_text(self, result: Dict[str, Any]) -> str:
+        full_text = (result.get("full_text") or "").strip()
+        if full_text:
+            return full_text
         final_text = (result.get("final_text") or "").strip()
         if final_text:
             return final_text

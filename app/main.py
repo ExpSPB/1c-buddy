@@ -7,6 +7,7 @@ import sys
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -196,6 +197,10 @@ app.include_router(chat_router)
 
 # Mount MCP Streamable HTTP endpoint
 app.include_router(mcp_router)
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/chat", status_code=307)
 
 @app.get("/health")
 async def health():

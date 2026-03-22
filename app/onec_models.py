@@ -86,9 +86,15 @@ ConversationSession.update_usage = _conversation_session_update_usage
 
 class ApiError(Exception):
     """1C.ai API error."""
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ):
         self.message = message
         self.status_code = status_code
+        self.data = data or {}
         super().__init__(self.message)
 
 

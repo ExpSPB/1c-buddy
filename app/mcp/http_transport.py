@@ -21,6 +21,7 @@ from .models import (
 from .session import McpSessionStore, validate_origin
 from .handlers import McpHandlers, ToolNotFoundError
 from .upstream_tools_client import McpUpstreamToolsClient
+from ..onec_models import ApiError
 
 router = APIRouter()
 
@@ -61,6 +62,15 @@ def _bad_request(message: str, data: Any = None) -> JSONResponse:
         error=JsonRpcError(code=-32600, message=message, data=data),
     ).model_dump(exclude_none=True)
     return JSONResponse(status_code=400, content=body)
+
+
+def _api_error_data(err: ApiError) -> Dict[str, Any]:
+    data: Dict[str, Any] = dict(err.data or {})
+    if err.status_code is not None and "upstream_status" not in data:
+        data["upstream_status"] = err.status_code
+    if "detail" not in data:
+        data["detail"] = str(err)
+    return data
 
 
 @router.post("/mcp")
@@ -164,6 +174,8 @@ async def mcp_endpoint(request: Request, response: Response):
                     status_code=200,
                     content=JsonRpcResponse(jsonrpc="2.0", id=req_id, result=result.model_dump()).model_dump(exclude_none=True),
                 )
+            except ApiError as e:
+                return _jsonrpc_error(req_id, -32603, "Internal error", _api_error_data(e))
             except Exception as e:
                 return _jsonrpc_error(req_id, -32603, "Internal error", {"detail": str(e)})
 
@@ -181,6 +193,8 @@ async def mcp_endpoint(request: Request, response: Response):
                 )
             except ToolNotFoundError:
                 return _jsonrpc_error(req_id, -32601, "Tool not found", {"name": params.name})
+            except ApiError as e:
+                return _jsonrpc_error(req_id, -32603, "Internal error", _api_error_data(e))
             except Exception as e:
                 return _jsonrpc_error(req_id, -32603, "Internal error", {"detail": str(e)})
 

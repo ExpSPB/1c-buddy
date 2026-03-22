@@ -4,7 +4,6 @@ import json
 import logging
 import re
 from typing import Any, Dict, Optional
-from uuid import uuid4
 
 import httpx
 
@@ -82,6 +81,7 @@ class McpUpstreamToolsClient:
             raise ApiError(
                 f"Conversation create error: {resp.status_code}",
                 resp.status_code,
+                data=self._extract_upstream_error_data(resp),
             )
 
         conv = ConversationResponse(**resp.json())
@@ -93,6 +93,55 @@ class McpUpstreamToolsClient:
     ) -> None:
         if assistant_uuid:
             self._last_assistant_uuid[conversation_id] = assistant_uuid
+
+    @staticmethod
+    def _extract_upstream_error_data(response: httpx.Response) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"upstream_status": response.status_code}
+        text = (response.text or "").strip()
+        if not text:
+            return data
+
+        try:
+            parsed = response.json()
+        except Exception:
+            data["detail"] = text[:2000]
+            return data
+
+        if isinstance(parsed, dict):
+            error_type = parsed.get("error_type")
+            if isinstance(error_type, str) and error_type.strip():
+                data["upstream_error_type"] = error_type.strip()
+
+            raw_error = parsed.get("error")
+            if isinstance(raw_error, list):
+                messages = []
+                for item in raw_error:
+                    if not isinstance(item, dict):
+                        continue
+                    msg = item.get("msg")
+                    if isinstance(msg, str) and msg.strip():
+                        messages.append(msg.strip())
+                if messages:
+                    data["detail"] = " | ".join(messages)
+                data["upstream_error"] = raw_error
+            elif isinstance(raw_error, dict):
+                data["upstream_error"] = raw_error
+                msg = raw_error.get("msg")
+                if isinstance(msg, str) and msg.strip():
+                    data["detail"] = msg.strip()
+            elif raw_error is not None:
+                data["upstream_error"] = raw_error
+
+            if "detail" not in data:
+                message = parsed.get("message")
+                if isinstance(message, str) and message.strip():
+                    data["detail"] = message.strip()
+                else:
+                    data["detail"] = text[:2000]
+            return data
+
+        data["detail"] = text[:2000]
+        return data
 
     async def _send_user_message(
         self,
@@ -120,6 +169,7 @@ class McpUpstreamToolsClient:
         aggregated_result: Dict[str, Any] = {
             "assistant_uuid": result.get("assistant_uuid"),
             "final_text": result.get("final_text") or "",
+            "full_text": result.get("full_text") or "",
             "tool_calls": list(result.get("tool_calls") or []),
             "tool_results": list(result.get("tool_results") or []),
             "tool_followups": list(result.get("tool_followups") or []),
@@ -137,6 +187,10 @@ class McpUpstreamToolsClient:
                     result.get("final_text")
                     or aggregated_result.get("final_text")
                     or ""
+                )
+                aggregated_result["full_text"] = self._merge_full_text(
+                    aggregated_result.get("full_text") or "",
+                    result.get("full_text") or result.get("final_text") or "",
                 )
                 aggregated_result["tool_calls"] = list(tool_calls)
                 return aggregated_result
@@ -156,6 +210,10 @@ class McpUpstreamToolsClient:
                 result.get("final_text")
                 or aggregated_result.get("final_text")
                 or ""
+            )
+            aggregated_result["full_text"] = self._merge_full_text(
+                aggregated_result.get("full_text") or "",
+                result.get("full_text") or result.get("final_text") or "",
             )
             aggregated_result["tool_calls"] = list(result.get("tool_calls") or [])
             aggregated_result["tool_results"].extend(result.get("tool_results") or [])
@@ -180,35 +238,23 @@ class McpUpstreamToolsClient:
             raise ApiError("Unable to obtain assistant parent UUID for MCP tool call")
         return assistant_uuid
 
-    def _build_tool_payload(
+    def _build_tool_ack_payload(
         self,
-        tool_name: str,
-        arguments: Dict[str, Any],
-        parent_uuid: str,
         *,
-        tool_call_id: Optional[str] = None,
-        ensure_ascii: bool = False,
-    ) -> tuple[Dict[str, Any], str]:
-        call_id = tool_call_id or f"call_{uuid4().hex[:24]}"
-        function_call = {
-            "id": call_id,
-            "type": "function",
-            "function": {
-                "name": tool_name,
-                "arguments": json.dumps(arguments, ensure_ascii=ensure_ascii),
-            },
-        }
+        parent_uuid: str,
+        tool_call_id: str,
+    ) -> Dict[str, Any]:
         request = ToolResultRequest(
             parent_uuid=parent_uuid,
             content=[
                 ToolResultItem(
-                    content=json.dumps(function_call, ensure_ascii=ensure_ascii),
-                    name=tool_name,
-                    tool_call_id=call_id,
+                    status="accepted",
+                    tool_call_id=tool_call_id,
+                    content=None,
                 )
             ],
         )
-        return request.model_dump(), call_id
+        return request.model_dump()
 
     async def _request_exact_tool_call(
         self,
@@ -328,6 +374,30 @@ class McpUpstreamToolsClient:
             return candidate
         return candidate
 
+    @staticmethod
+    def _merge_full_text(current_text: str, candidate_text: str) -> str:
+        current = (current_text or "").strip()
+        candidate = (candidate_text or "").strip()
+        if not candidate:
+            return current
+        if not current:
+            return candidate
+        if candidate == current:
+            return current
+        if candidate in current:
+            return current
+        if current in candidate:
+            return candidate
+        if candidate.startswith(current):
+            return candidate
+        if current.startswith(candidate):
+            return current
+        max_overlap = min(len(current), len(candidate))
+        for overlap in range(max_overlap, 0, -1):
+            if current[-overlap:] == candidate[:overlap]:
+                return f"{current}{candidate[overlap:]}"
+        return f"{current}\n\n{candidate}"
+
     def _extract_task_result_text(self, tool_calls: list[dict[str, Any]]) -> Optional[str]:
         for tool_call in tool_calls:
             function = tool_call.get("function") or {}
@@ -352,13 +422,9 @@ class McpUpstreamToolsClient:
         tool_call_id = tool_call.get("id") or ""
         if not tool_name or not tool_call_id:
             raise ApiError("Upstream tool call is missing tool name or id")
-        arguments = self._parse_tool_arguments(function.get("arguments"))
-        payload, _ = self._build_tool_payload(
-            tool_name,
-            arguments,
-            assistant_uuid,
+        payload = self._build_tool_ack_payload(
+            parent_uuid=assistant_uuid,
             tool_call_id=tool_call_id,
-            ensure_ascii=ensure_ascii,
         )
         return await self._collect_stream(conversation_id, payload)
 
@@ -368,6 +434,7 @@ class McpUpstreamToolsClient:
         result: Dict[str, Any] = {
             "assistant_uuid": None,
             "final_text": "",
+            "full_text": "",
             "tool_calls": [],
             "tool_results": [],
             "tool_followups": [],
@@ -376,6 +443,28 @@ class McpUpstreamToolsClient:
         request_headers = {"Accept": "text/event-stream"}
         accumulated_text = ""
         last_tool_call_id = ""
+        assistant_segments: list[str] = []
+        current_assistant_uuid: Optional[str] = None
+
+        def build_visible_text(current_round_text: str) -> str:
+            prefix = "\n\n".join(assistant_segments).strip()
+            current = (current_round_text or "").strip()
+            if prefix and current:
+                return f"{prefix}\n\n{current}"
+            if prefix:
+                return prefix
+            if current:
+                return current
+            return ""
+
+        def append_assistant_segment(segment_text: str) -> str:
+            segment = (segment_text or "").strip()
+            if not segment:
+                return build_visible_text("")
+            if assistant_segments and assistant_segments[-1] == segment:
+                return build_visible_text("")
+            assistant_segments.append(segment)
+            return build_visible_text("")
 
         logger.debug(
             "MCP upstream POST: url=%s conversation_id=%s payload=%s",
@@ -388,9 +477,11 @@ class McpUpstreamToolsClient:
             "POST", url, json=payload, headers=request_headers
         ) as response:
             if response.status_code != 200:
+                await response.aread()
                 raise ApiError(
                     f"Message send error: {response.status_code}",
                     response.status_code,
+                    data=self._extract_upstream_error_data(response),
                 )
 
             response.encoding = "utf-8"
@@ -402,6 +493,9 @@ class McpUpstreamToolsClient:
                 except Exception as e:
                     logger.warning("MCP upstream parse/model error: %s", e)
                     continue
+
+                if chunk.role == "assistant" and chunk.uuid:
+                    current_assistant_uuid = chunk.uuid
 
                 if chunk.role == "tool" and chunk.finished:
                     for ri in (chunk.render_info or []):
@@ -431,17 +525,43 @@ class McpUpstreamToolsClient:
                     raw_text = chunk.content_delta.content
                     accumulated_text += raw_text
 
+                current_visible_text = build_visible_text(accumulated_text)
+                if current_visible_text:
+                    result["full_text"] = current_visible_text
+
                 if chunk.finished and chunk.role == "assistant":
-                    result["assistant_uuid"] = chunk.uuid
-                    result["final_text"] = accumulated_text or raw_text or ""
-                    self._remember_assistant_uuid(conversation_id, chunk.uuid)
+                    assistant_uuid = chunk.uuid or current_assistant_uuid
+                    result["assistant_uuid"] = assistant_uuid
+                    result["final_text"] = (accumulated_text or raw_text or "").strip()
+                    if assistant_uuid:
+                        self._remember_assistant_uuid(conversation_id, assistant_uuid)
+
+                    tc_list = (chunk.content or {}).get("tool_calls") or []
+                    if tc_list:
+                        result["tool_calls"] = tc_list
+                        last_tool_call_id = tc_list[-1].get("id", "") or last_tool_call_id
+                        result["full_text"] = append_assistant_segment(accumulated_text)
+                        accumulated_text = ""
+                    else:
+                        result["full_text"] = build_visible_text(accumulated_text)
                     break
 
-            if last_tool_call_id and result["final_text"] and result["tool_results"]:
+            fallback_visible_text = build_visible_text(accumulated_text)
+            if fallback_visible_text:
+                result["full_text"] = fallback_visible_text
+                if not result["final_text"]:
+                    result["final_text"] = fallback_visible_text
+
+            if not result["assistant_uuid"] and current_assistant_uuid:
+                result["assistant_uuid"] = current_assistant_uuid
+                self._remember_assistant_uuid(conversation_id, current_assistant_uuid)
+
+            followup_text = (result.get("full_text") or result.get("final_text") or "").strip()
+            if last_tool_call_id and followup_text and result["tool_results"]:
                 result["tool_followups"].append(
                     {
                         "tool_call_id": last_tool_call_id,
-                        "text": result["final_text"],
+                        "text": followup_text,
                     }
                 )
 
@@ -455,63 +575,21 @@ class McpUpstreamToolsClient:
         skill: str,
         parent_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        resolved_parent = await self._ensure_assistant_parent_uuid(
-            conversation_id, parent_uuid=parent_uuid
+        _ = skill
+        result = await self.call_prompt(
+            conversation_id,
+            instruction=instruction,
+            parent_uuid=parent_uuid,
         )
-        args: Dict[str, Any] = {"instruction": instruction, "skill": skill}
-        payload, _ = self._build_tool_payload(
-            "Task", args, resolved_parent, ensure_ascii=False
-        )
-        result = await self._collect_stream(conversation_id, payload)
-        todo_seen = self._has_tool_name(result.get("tool_calls") or [], "TodoWrite")
-        aggregated_result: Dict[str, Any] = {
-            "assistant_uuid": result.get("assistant_uuid"),
-            "final_text": result.get("final_text") or "",
-            "tool_calls": list(result.get("tool_calls") or []),
-            "tool_results": list(result.get("tool_results") or []),
-            "tool_followups": list(result.get("tool_followups") or []),
-        }
-
-        while True:
-            task_result_text = self._extract_task_result_text(result.get("tool_calls") or [])
-            if task_result_text:
-                aggregated_result["assistant_uuid"] = result.get("assistant_uuid") or aggregated_result.get("assistant_uuid")
-                aggregated_result["final_text"] = task_result_text
-                aggregated_result["tool_calls"] = []
-                return aggregated_result
-
-            tool_calls = result.get("tool_calls") or []
-            assistant_uuid = result.get("assistant_uuid")
-            if not tool_calls or not assistant_uuid:
-                aggregated_result["assistant_uuid"] = result.get("assistant_uuid") or aggregated_result.get("assistant_uuid")
-                aggregated_result["final_text"] = self._prefer_final_text(
-                    aggregated_result.get("final_text") or "",
-                    result.get("final_text") or "",
-                    todo_seen=todo_seen,
-                )
-                aggregated_result["tool_calls"] = list(result.get("tool_calls") or [])
-                return aggregated_result
-
-            next_call = tool_calls[-1]
-            result = await self._respond_to_tool_call(
-                conversation_id,
-                assistant_uuid=assistant_uuid,
-                tool_call=next_call,
-                ensure_ascii=False,
+        task_result_text = self._extract_task_result_text(result.get("tool_calls") or [])
+        if task_result_text:
+            result["final_text"] = task_result_text
+            result["full_text"] = self._merge_full_text(
+                result.get("full_text") or "",
+                task_result_text,
             )
-            todo_seen = todo_seen or self._has_tool_name(
-                result.get("tool_calls") or [],
-                "TodoWrite",
-            )
-            aggregated_result["assistant_uuid"] = result.get("assistant_uuid") or aggregated_result.get("assistant_uuid")
-            aggregated_result["final_text"] = self._prefer_final_text(
-                aggregated_result.get("final_text") or "",
-                result.get("final_text") or "",
-                todo_seen=todo_seen,
-            )
-            aggregated_result["tool_calls"] = list(result.get("tool_calls") or [])
-            aggregated_result["tool_results"].extend(result.get("tool_results") or [])
-            aggregated_result["tool_followups"].extend(result.get("tool_followups") or [])
+            result["tool_calls"] = []
+        return result
 
     async def call_exact_tool(
         self,
@@ -528,11 +606,9 @@ class McpUpstreamToolsClient:
             arguments,
             parent_uuid=parent_uuid,
         )
-        payload, _ = self._build_tool_payload(
-            tool_name,
-            arguments,
-            assistant_uuid,
+        _ = payload_ensure_ascii
+        payload = self._build_tool_ack_payload(
+            parent_uuid=assistant_uuid,
             tool_call_id=tool_call_id,
-            ensure_ascii=payload_ensure_ascii,
         )
         return await self._collect_stream(conversation_id, payload)
