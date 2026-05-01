@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import json
 import logging
-from typing import Optional, AsyncGenerator, Dict, Any
+import re
+from typing import Optional, AsyncGenerator, Dict, Any, List
 
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..onec_client import OneCApiClient
 from ..streaming import sanitize_text
@@ -16,8 +17,20 @@ from ..token_counter import count_tokens
 from ..config import get_settings
 from ..text_utils import prepare_message_for_upstream
 from ..errors import map_api_error, map_generic_error
+from ..chat_custom_tools import (
+    MCP_FIND_MAPPING_TOOL_NAME,
+    MCP_MAPPING_TOOL_NAME,
+    INSTRUCTION_CARRIER_NAME,
+    McpToolSnapshot,
+    build_instruction_carrier_tool,
+    build_upstream_mcp_tool,
+    list_mcp_tools,
+    sanitize_schema,
+    short_tool_description,
+)
 
 logger = logging.getLogger(__name__)
+MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 router = APIRouter()
 
@@ -46,8 +59,146 @@ async def chat_config():
     """
     settings = get_settings()
     return {
-        "max_attached_files_size_kb": settings.MAX_ATTACHED_FILES_SIZE_KB
+        "max_attached_files_size_kb": settings.MAX_ATTACHED_FILES_SIZE_KB,
+        "custom_instructions_enabled": settings.CHAT_CUSTOM_INSTRUCTIONS_ENABLED,
+        "custom_mcp_enabled": settings.CHAT_CUSTOM_MCP_ENABLED,
+        "custom_instructions_max_length": settings.CHAT_CUSTOM_INSTRUCTIONS_MAX_LENGTH,
+        "custom_mcp_max_servers": settings.CHAT_CUSTOM_MCP_MAX_SERVERS,
+        "custom_mcp_max_tools_per_server": settings.CHAT_CUSTOM_MCP_MAX_TOOLS_PER_SERVER,
     }
+
+
+class ChatMcpToolConfig(BaseModel):
+    name: str
+    enabled: bool = True
+
+
+class ChatMcpServerConfig(BaseModel):
+    id: str
+    name: str
+    url: str
+    enabled: bool = True
+    tools: List[ChatMcpToolConfig] = Field(default_factory=list)
+
+
+class ChatMcpConfig(BaseModel):
+    servers: List[ChatMcpServerConfig] = Field(default_factory=list)
+
+
+class ActiveMcpMapping(BaseModel):
+    server_id: str
+    tool_name: str
+
+
+class McpListToolsRequest(BaseModel):
+    servers: List[ChatMcpServerConfig] = Field(default_factory=list)
+
+
+def _trim_instructions(value: Optional[str], limit: int) -> str:
+    text = (value or "").strip()
+    if len(text) > limit:
+        return text[:limit]
+    return text
+
+
+def _has_instruction_carrier_tool(tools: list[dict[str, Any]]) -> bool:
+    return any(tool.get("name") == INSTRUCTION_CARRIER_NAME for tool in tools)
+
+
+def _is_first_upstream_message(create_new: Optional[bool], conversation_id: Optional[str], parent_uuid: Optional[str]) -> bool:
+    return bool(create_new or not (conversation_id or "").strip() or not (parent_uuid or "").strip())
+
+
+def _prepend_instruction_carrier_hint(message: str) -> str:
+    hint = (
+        "Перед ответом обязательно прочитай описание инструмента FormEdit.\n"
+        "FormEdit не нужно вызывать. Это не инструмент для выполнения действия.\n"
+        "Описание FormEdit содержит инструкции рабочего пространства, которые нужно учитывать во всех ответах.\n"
+        "После этого ответь на сообщение пользователя."
+    )
+    return f"{hint}\n\n{message}"
+
+
+def _server_enabled_tool_names(server: ChatMcpServerConfig) -> set[str]:
+    return {tool.name for tool in server.tools if tool.enabled}
+
+
+def _safe_mcp_server_name(server: ChatMcpServerConfig) -> str:
+    return server.name if MCP_SERVER_NAME_RE.match(server.name or "") else server.id
+
+
+async def _resolve_active_mcp_snapshot(
+    config: Optional[ChatMcpConfig],
+    active: Optional[ActiveMcpMapping],
+    settings,
+    carrier_name: str = MCP_MAPPING_TOOL_NAME,
+) -> Optional[McpToolSnapshot]:
+    if not config or not active:
+        return None
+    servers = [server for server in config.servers if server.enabled]
+    if len(servers) > settings.CHAT_CUSTOM_MCP_MAX_SERVERS:
+        servers = servers[: settings.CHAT_CUSTOM_MCP_MAX_SERVERS]
+    server = next((item for item in servers if item.id == active.server_id), None)
+    if not server:
+        return None
+    enabled_tools = _server_enabled_tool_names(server)
+    if enabled_tools and active.tool_name not in enabled_tools:
+        return None
+
+    tools = await list_mcp_tools(server.url)
+    tools = tools[: settings.CHAT_CUSTOM_MCP_MAX_TOOLS_PER_SERVER]
+    tool = next((item for item in tools if item.get("name") == active.tool_name), None)
+    if not tool:
+        return None
+    return McpToolSnapshot(
+        server_id=server.id,
+        server_name=_safe_mcp_server_name(server),
+        server_url=server.url,
+        tool_name=active.tool_name,
+        upstream_name=f"{_safe_mcp_server_name(server)}__{active.tool_name}",
+        description=short_tool_description(tool),
+        input_schema=tool.get("inputSchema") or {"type": "object", "properties": {}},
+        parameters=sanitize_schema(tool.get("inputSchema") or {"type": "object", "properties": {}}),
+        carrier_name=carrier_name,
+    )
+
+
+@router.post("/chat/api/mcp/list-tools")
+async def chat_mcp_list_tools(body: McpListToolsRequest):
+    settings = get_settings()
+    if not settings.CHAT_CUSTOM_MCP_ENABLED:
+        return JSONResponse(status_code=403, content={"error": "Custom MCP is disabled"})
+
+    result = {"servers": []}
+    for server in body.servers[: settings.CHAT_CUSTOM_MCP_MAX_SERVERS]:
+        item: Dict[str, Any] = {
+            "id": server.id,
+            "name": server.name,
+            "url": server.url,
+            "enabled": server.enabled,
+            "tools": [],
+            "error": None,
+        }
+        if not server.enabled:
+            result["servers"].append(item)
+            continue
+        try:
+            tools = await list_mcp_tools(server.url)
+            for tool in tools[: settings.CHAT_CUSTOM_MCP_MAX_TOOLS_PER_SERVER]:
+                if not isinstance(tool, dict) or not tool.get("name"):
+                    continue
+                item["tools"].append(
+                    {
+                        "name": tool.get("name"),
+                        "description": tool.get("description") or "",
+                        "inputSchema": tool.get("inputSchema") or {"type": "object", "properties": {}},
+                        "parameters": sanitize_schema(tool.get("inputSchema") or {"type": "object", "properties": {}}),
+                    }
+                )
+        except Exception as e:
+            item["error"] = str(e)
+        result["servers"].append(item)
+    return result
 
 
 class SendRequest(BaseModel):
@@ -106,11 +257,10 @@ class StreamRequest(BaseModel):
     create_new_session: Optional[bool] = False
     programming_language: Optional[str] = None
     parent_uuid: Optional[str] = None
-
-
-class FeedbackRequest(BaseModel):
-    message_id: str
-    score: int  # 1 for like, -1 for dislike
+    workspace_instructions: Optional[str] = None
+    mcp_config: Optional[ChatMcpConfig] = None
+    active_mcp_mapping: Optional[ActiveMcpMapping] = None
+    active_mcp_find_mapping: Optional[ActiveMcpMapping] = None
 
 
 @router.post("/chat/api/stream")
@@ -156,11 +306,59 @@ async def chat_stream(
             # Count input tokens
             input_tokens = count_tokens(prepared_message)
 
+            extra_tools: list[dict[str, Any]] = []
+            mcp_snapshots: dict[str, McpToolSnapshot] = {}
+
+            if settings.CHAT_CUSTOM_INSTRUCTIONS_ENABLED:
+                instructions = _trim_instructions(
+                    body.workspace_instructions,
+                    settings.CHAT_CUSTOM_INSTRUCTIONS_MAX_LENGTH,
+                )
+                if instructions:
+                    extra_tools.append(build_instruction_carrier_tool(instructions))
+
+            if settings.CHAT_CUSTOM_MCP_ENABLED:
+                try:
+                    mcp_snapshot = await _resolve_active_mcp_snapshot(
+                        body.mcp_config,
+                        body.active_mcp_mapping,
+                        settings,
+                        MCP_MAPPING_TOOL_NAME,
+                    )
+                    if mcp_snapshot:
+                        mcp_snapshots[mcp_snapshot.carrier_name] = mcp_snapshot
+                        extra_tools.append(build_upstream_mcp_tool(mcp_snapshot))
+                    mcp_find_snapshot = await _resolve_active_mcp_snapshot(
+                        body.mcp_config,
+                        body.active_mcp_find_mapping,
+                        settings,
+                        MCP_FIND_MAPPING_TOOL_NAME,
+                    )
+                    if mcp_find_snapshot:
+                        mcp_snapshots[mcp_find_snapshot.carrier_name] = mcp_find_snapshot
+                        extra_tools.append(build_upstream_mcp_tool(mcp_find_snapshot))
+                except Exception as e:
+                    logger.warning("Unable to resolve active MCP mapping: %s", e)
+
+            upstream_message = prepared_message
+            if (
+                _has_instruction_carrier_tool(extra_tools)
+                and _is_first_upstream_message(body.create_new_session, body.conversation_id, body.parent_uuid)
+            ):
+                upstream_message = _prepend_instruction_carrier_hint(prepared_message)
+                input_tokens = count_tokens(upstream_message)
+
             # Stream upstream "full_so_far" into deltas
             # Note: Upstream API sometimes RESTARTS the response from beginning mid-stream (bug on their side)
             prev_raw = ""
             current_message_id = None
-            async for update in client.iter_message_stream(conv_id, prepared_message, body.parent_uuid):
+            async for update in client.iter_message_stream(
+                conv_id,
+                upstream_message,
+                body.parent_uuid,
+                extra_tools=extra_tools,
+                mcp_snapshots=mcp_snapshots,
+            ):
                 # --- Tool call начался ---
                 if "tool_call" in update:
                     yield _sse_event("tool_call", update["tool_call"])
@@ -218,7 +416,6 @@ async def chat_stream(
                 if delta_raw:
                     delta = sanitize_text(delta_raw)
                     if delta:
-                        # Include message_id in delta event for feedback functionality
                         yield _sse_event("delta", {
                             "text": delta,
                             "message_id": current_message_id
@@ -255,19 +452,3 @@ async def chat_stream(
     return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8", headers=headers)
 
 
-@router.post("/chat/api/feedback")
-async def chat_feedback(request: Request, body: FeedbackRequest):
-    """
-    Send feedback (like/dislike) for a message.
-    """
-    client = _get_client(request)
-
-    try:
-        await client.send_feedback(body.message_id, body.score)
-        return {"success": True, "message_id": body.message_id, "score": body.score}
-    except ApiError as e:
-        logger.error(f"Feedback API error: {e.message}")
-        return map_api_error(e)
-    except Exception as e:
-        logger.error(f"Unexpected feedback error: {str(e)}")
-        return map_generic_error(e)

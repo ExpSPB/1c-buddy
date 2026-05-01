@@ -36,6 +36,7 @@
             <h1>Чат с 1С:Напарник</h1>
           </div>
           <div class="controls">
+            <button id="settings-btn" title="Настройки" hidden>⚙</button>
             <button id="search-btn" title="Поиск по истории">🔍</button>
             <button id="export-btn" title="Экспорт истории">📥</button>
             <button id="clear-chat-btn" title="Очистить диалог">🗑️ Очистить</button>
@@ -136,6 +137,62 @@
           </div>
         </div>
       </aside>
+    </div>
+
+    <div id="settings-modal" class="settings-modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="settings-dialog">
+        <div class="settings-header">
+          <h2 id="settings-title">Настройки</h2>
+          <button id="settings-close-btn" class="settings-icon-btn" title="Закрыть" aria-label="Закрыть">✕</button>
+        </div>
+        <div class="settings-tabs">
+          <button class="settings-tab active" data-tab="instructions">Инструкции</button>
+          <button class="settings-tab" data-tab="mcp">MCP сервера</button>
+        </div>
+        <div class="settings-body">
+          <section id="settings-tab-instructions" class="settings-panel active">
+            <div class="settings-disabled" id="instructions-disabled" hidden>Пользовательские инструкции отключены на сервере.</div>
+            <label class="settings-label" for="workspace-instructions-input">Инструкции рабочего пространства</label>
+            <textarea id="workspace-instructions-input" class="settings-textarea" rows="10"></textarea>
+          </section>
+          <section id="settings-tab-mcp" class="settings-panel">
+            <div class="settings-disabled" id="mcp-disabled" hidden>Пользовательские MCP-серверы отключены на сервере.</div>
+            <div class="mcp-server-form">
+              <input id="mcp-server-name" type="text" placeholder="server_name" pattern="[A-Za-z][A-Za-z0-9_-]*" title="Латиница, цифры, _ и -. Первый символ — буква." />
+              <input id="mcp-server-url" type="url" placeholder="http://192.168.0.1:6003/mcp" />
+              <button id="mcp-add-server-btn" class="settings-action-primary"><span class="settings-btn-icon">＋</span> Добавить</button>
+            </div>
+            <div id="mcp-server-form-error" class="settings-inline-error" hidden></div>
+            <div id="mcp-servers-list" class="mcp-servers-list"></div>
+            <div class="mcp-mapping">
+              <div class="settings-label">Активные инструменты</div>
+              <div class="mcp-active-tool-row">
+                <select id="mcp-active-tool-select"></select>
+                <div id="mcp-active-tool-name" class="settings-hint"></div>
+              </div>
+              <div class="mcp-active-tool-row">
+                <select id="mcp-active-find-tool-select"></select>
+                <div id="mcp-active-find-tool-name" class="settings-hint"></div>
+              </div>
+              <div id="mcp-active-tool-error" class="settings-inline-error settings-inline-error-dismissible" hidden>
+                <span id="mcp-active-tool-error-text"></span>
+                <button id="mcp-active-tool-error-close" type="button" class="settings-inline-error-close" title="Закрыть" aria-label="Закрыть">×</button>
+              </div>
+            </div>
+          </section>
+        </div>
+        <div class="settings-footer">
+          <div class="settings-actions">
+            <button id="instructions-save-btn" class="settings-action-primary" title="Сохранить настройки"><span class="settings-btn-icon">✓</span> Сохранить</button>
+            <button id="instructions-reset-btn" class="settings-action-warn" title="Сбросить настройки текущей вкладки"><span class="settings-btn-icon">↺</span> Сбросить</button>
+            <button id="settings-export-btn" class="settings-action-info" title="Экспортировать все настройки в JSON-файл"><span class="settings-btn-icon">↓</span> Экспорт</button>
+            <button id="settings-import-btn" class="settings-action-info" title="Импортировать настройки из JSON-файла"><span class="settings-btn-icon">↑</span> Импорт</button>
+            <button id="settings-footer-close-btn" class="settings-action-neutral" title="Закрыть окно настроек"><span class="settings-btn-icon">×</span> Закрыть</button>
+            <input id="settings-import-file" type="file" accept="application/json,.json" hidden />
+          </div>
+          <div id="settings-save-feedback" class="settings-save-feedback" aria-live="polite"></div>
+        </div>
+      </div>
     </div>
 
     <script src="/chat/static/conversations.js"></script>

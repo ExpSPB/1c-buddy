@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     ONEC_AI_UI_LANGUAGE: str = Field("russian", alias="ONEC_AI_UI_LANGUAGE")
     ONEC_AI_PROGRAMMING_LANGUAGE: str = Field("", alias="ONEC_AI_PROGRAMMING_LANGUAGE")
     ONEC_AI_SCRIPT_LANGUAGE: str = Field("", alias="ONEC_AI_SCRIPT_LANGUAGE")
+    DEFAULT_SSL_VERSION: str = Field("", alias="DEFAULT_SSL_VERSION")
+    DEFAULT_1C_CONFIGURATION: str = Field("", alias="DEFAULT_1C_CONFIGURATION")
 
     # Session management
     MAX_ACTIVE_SESSIONS: int = Field(300, alias="MAX_ACTIVE_SESSIONS")
@@ -52,6 +54,13 @@ class Settings(BaseSettings):
 
     # Chat file attachments
     MAX_ATTACHED_FILES_SIZE_KB: int = Field(100, alias="MAX_ATTACHED_FILES_SIZE_KB", description="Maximum total size of attached files in KB")
+
+    # Chat customization
+    CHAT_CUSTOM_INSTRUCTIONS_ENABLED: bool = Field(False, alias="CHAT_CUSTOM_INSTRUCTIONS_ENABLED")
+    CHAT_CUSTOM_MCP_ENABLED: bool = Field(False, alias="CHAT_CUSTOM_MCP_ENABLED")
+    CHAT_CUSTOM_INSTRUCTIONS_MAX_LENGTH: int = Field(4000, alias="CHAT_CUSTOM_INSTRUCTIONS_MAX_LENGTH")
+    CHAT_CUSTOM_MCP_MAX_SERVERS: int = Field(10, alias="CHAT_CUSTOM_MCP_MAX_SERVERS")
+    CHAT_CUSTOM_MCP_MAX_TOOLS_PER_SERVER: int = Field(100, alias="CHAT_CUSTOM_MCP_MAX_TOOLS_PER_SERVER")
 
     # Public model id to report to clients
     PUBLIC_MODEL_ID: str = Field("1c-buddy", alias="PUBLIC_MODEL_ID")

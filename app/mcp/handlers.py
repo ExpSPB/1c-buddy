@@ -123,6 +123,30 @@ class McpHandlers:
     def _use_direct_mode(self) -> bool:
         return (self.client.settings.MCP_TOOL_CALL_MODE or "standard").strip().lower() == "direct"
 
+    def _default_ssl_version(self) -> str:
+        return (self.client.settings.DEFAULT_SSL_VERSION or "").strip()
+
+    def _default_1c_config(self) -> str:
+        return (self.client.settings.DEFAULT_1C_CONFIGURATION or "").strip()
+
+    def _build_context_prefix(self, config: str, ssl_version: str) -> str:
+        parts = []
+        if config:
+            parts.append(config)
+        if ssl_version:
+            parts.append(f"БСП {ssl_version}")
+        return " ".join(parts)
+
+    def _build_context_hint(self, config: str, ssl_version: str) -> str:
+        parts = []
+        if config:
+            parts.append(f"конфигурация {config}")
+        if ssl_version:
+            parts.append(f"версия БСП {ssl_version}")
+        if not parts:
+            return ""
+        return "Контекст проекта: " + ", ".join(parts) + "."
+
     @staticmethod
     def _build_check_review_prompt(code: str) -> str:
         return (
@@ -180,11 +204,13 @@ class McpHandlers:
         )
 
     @staticmethod
-    def _build_search_its_prompt(query: str) -> str:
+    def _build_search_its_prompt(query: str, context_hint: str = "") -> str:
+        hint_line = f"{context_hint}\n" if context_hint else ""
         return (
             "Выполни поиск в базе знаний ИТС по этому запросу. "
-            "Верни фактический результат и обязательно сохрани ссылки на источники.\n\n"
-            f"Запрос: {query}"
+            "Верни фактический результат и обязательно сохрани ссылки на источники.\n"
+            f"{hint_line}"
+            f"\nЗапрос: {query}"
         )
 
     @staticmethod
@@ -216,6 +242,30 @@ class McpHandlers:
         min_len = getattr(s, "MCP_TOOL_INPUT_MIN_LENGTH", 0)
         max_len = getattr(s, "MCP_TOOL_INPUT_MAX_LENGTH", 200000)
 
+        default_ssl = self._default_ssl_version()
+        default_config = self._default_1c_config()
+
+        ssl_desc = "Версия Библиотеки Стандартных Подсистем (БСП)."
+        if default_ssl:
+            ssl_desc += f" По умолчанию: {default_ssl}."
+
+        config_desc = "Конфигурация 1С (например: Бухгалтерия предприятия, ERP, Управление торговлей)."
+        if default_config:
+            config_desc += f" По умолчанию: {default_config}."
+
+        project_context_schema = {
+            "ssl_version": {
+                "type": "string",
+                "description": ssl_desc,
+                "default": default_ssl,
+            },
+            "configuration": {
+                "type": "string",
+                "description": config_desc,
+                "default": default_config,
+            },
+        }
+
         tools = [
             ToolDesc(
                 name="ask_1c_ai",
@@ -242,6 +292,7 @@ class McpHandlers:
                             "default": "",
                             "maxLength": max_len,
                         },
+                        **project_context_schema,
                     },
                     "required": ["question"],
                 },
@@ -270,6 +321,7 @@ class McpHandlers:
                             "minLength": 0,
                             "maxLength": max_len,
                         },
+                        **project_context_schema,
                     },
                     "required": ["syntax_element"],
                 },
@@ -389,6 +441,7 @@ class McpHandlers:
                             "minLength": min_len,
                             "maxLength": max_len,
                         },
+                        **project_context_schema,
                     },
                     "required": ["query"],
                 },
@@ -463,8 +516,13 @@ class McpHandlers:
         if name == "ask_1c_ai":
             question = (args.get("question") or "").strip()
             programming_language = (args.get("programming_language") or "").strip() or None
+            ssl_version = (args.get("ssl_version") or "").strip() or self._default_ssl_version()
+            config = (args.get("configuration") or "").strip() or self._default_1c_config()
             if not question:
                 return ToolsCallResult(content=[ToolsCallTextContent(text="Ошибка: Вопрос не может быть пустым")])
+            hint = self._build_context_hint(config, ssl_version)
+            if hint:
+                question += f"\n\n{hint}"
             prepared_question, _ = prepare_message_for_upstream(question, self.client.settings)
             conv_id = await self._create_isolated_conversation(
                 session_id, programming_language=programming_language
@@ -484,11 +542,16 @@ class McpHandlers:
         if name == "explain_1c_syntax":
             syntax_element = (args.get("syntax_element") or "").strip()
             context = (args.get("context") or "").strip()
+            ssl_version = (args.get("ssl_version") or "").strip() or self._default_ssl_version()
+            config = (args.get("configuration") or "").strip() or self._default_1c_config()
             if not syntax_element:
                 return ToolsCallResult(content=[ToolsCallTextContent(text="Ошибка: Элемент синтаксиса не может быть пустым")])
             question = f"Объясни синтаксис и использование: {syntax_element}"
             if context:
                 question += f" в контексте: {context}"
+            hint = self._build_context_hint(config, ssl_version)
+            if hint:
+                question += f"\n\n{hint}"
             prepared_question, _ = prepare_message_for_upstream(question, self.client.settings)
             conv_id = await self._create_isolated_conversation(session_id)
             if self._use_direct_mode():
@@ -586,20 +649,25 @@ class McpHandlers:
 
         if name in {"search_its", "Search_ITS"}:
             query = (args.get("query") or "").strip()
+            ssl_version = (args.get("ssl_version") or "").strip() or self._default_ssl_version()
+            config = (args.get("configuration") or "").strip() or self._default_1c_config()
             if not query:
                 return ToolsCallResult(content=[ToolsCallTextContent(text="Ошибка: query не может быть пустым")])
             conv_id = await self._create_isolated_conversation(session_id)
             if self._use_direct_mode():
+                prefix = self._build_context_prefix(config, ssl_version)
+                search_query = f"{prefix} {query}".strip() if prefix else query
                 result = await self.client.call_exact_tool(
                     conv_id,
                     tool_name="mcp__knowledge-hub__Search_ITS",
-                    arguments={"query": query},
+                    arguments={"query": search_query},
                 )
                 clean = sanitize_text(self._extract_tool_text(result, include_tool_details=True))
             else:
+                hint = self._build_context_hint(config, ssl_version)
                 result = await self.client.call_prompt(
                     conv_id,
-                    instruction=self._build_search_its_prompt(query),
+                    instruction=self._build_search_its_prompt(query, hint),
                 )
                 clean = sanitize_text(self._extract_standard_text(result))
             return ToolsCallResult(content=[ToolsCallTextContent(text=f"{clean}\n\nСессия: {session_id or '-'}\nРазговор: {conv_id}")])

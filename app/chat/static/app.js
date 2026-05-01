@@ -4,6 +4,7 @@
   const input = document.getElementById("message-input");
   const sendStopBtn = document.getElementById("send-stop-btn");
   const clearChatBtn = document.getElementById("clear-chat-btn");
+  const settingsBtn = document.getElementById("settings-btn");
   const searchBtn = document.getElementById("search-btn");
   const exportBtn = document.getElementById("export-btn");
   const searchContainer = document.getElementById("search-container");
@@ -22,6 +23,33 @@
   const desktopToggleBtn = document.getElementById("desktop-toggle-sidebar");
   const clearAllConversationsBtn = document.getElementById("clear-all-conversations-btn");
 
+  // Settings elements
+  const settingsModal = document.getElementById("settings-modal");
+  const settingsCloseBtn = document.getElementById("settings-close-btn");
+  const settingsFooterCloseBtn = document.getElementById("settings-footer-close-btn");
+  const settingsTabs = Array.from(document.querySelectorAll(".settings-tab"));
+  const workspaceInstructionsInput = document.getElementById("workspace-instructions-input");
+  const instructionsDisabled = document.getElementById("instructions-disabled");
+  const mcpDisabled = document.getElementById("mcp-disabled");
+  const instructionsSaveBtn = document.getElementById("instructions-save-btn");
+  const instructionsResetBtn = document.getElementById("instructions-reset-btn");
+  const settingsExportBtn = document.getElementById("settings-export-btn");
+  const settingsImportBtn = document.getElementById("settings-import-btn");
+  const settingsImportFile = document.getElementById("settings-import-file");
+  const settingsSaveFeedback = document.getElementById("settings-save-feedback");
+  const mcpServerNameInput = document.getElementById("mcp-server-name");
+  const mcpServerUrlInput = document.getElementById("mcp-server-url");
+  const mcpServerFormError = document.getElementById("mcp-server-form-error");
+  const mcpAddServerBtn = document.getElementById("mcp-add-server-btn");
+  const mcpServersList = document.getElementById("mcp-servers-list");
+  const mcpActiveToolSelect = document.getElementById("mcp-active-tool-select");
+  const mcpActiveToolName = document.getElementById("mcp-active-tool-name");
+  const mcpActiveFindToolSelect = document.getElementById("mcp-active-find-tool-select");
+  const mcpActiveFindToolName = document.getElementById("mcp-active-find-tool-name");
+  const mcpActiveToolError = document.getElementById("mcp-active-tool-error");
+  const mcpActiveToolErrorText = document.getElementById("mcp-active-tool-error-text");
+  const mcpActiveToolErrorClose = document.getElementById("mcp-active-tool-error-close");
+
   // Initialize Conversations Manager
   const conversationsManager = new window.ConversationsManager();
   
@@ -33,8 +61,19 @@
   let streaming = false;
   let currentAssistantBubble = null;
   let currentEventSource = null;
+  let currentSettingsTab = "instructions";
+  let settingsFeedbackTimer = null;
 
   const HISTORY_LIMIT = 500;
+  const CHAT_SETTINGS_KEY = "onec_chat_custom_settings";
+  const defaultChatCapabilities = {
+    custom_instructions_enabled: false,
+    custom_mcp_enabled: false,
+    custom_instructions_max_length: 4000,
+    custom_mcp_max_servers: 10,
+    custom_mcp_max_tools_per_server: 100
+  };
+  let chatCapabilities = { ...defaultChatCapabilities };
 
   function closeAllTokenTooltips(exceptTooltip = null) {
     document.querySelectorAll(".token-tooltip.visible").forEach((tooltip) => {
@@ -53,6 +92,602 @@
   // Token accumulation for current conversation
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+
+  function defaultChatSettings() {
+    return {
+      workspaceInstructions: "",
+      mcpServers: [],
+      activeMapping: null,
+      activeFindMapping: null
+    };
+  }
+
+  function loadChatSettings() {
+    try {
+      const raw = localStorage.getItem(CHAT_SETTINGS_KEY);
+      if (!raw) return defaultChatSettings();
+      const parsed = JSON.parse(raw);
+      return {
+        workspaceInstructions: String(parsed.workspaceInstructions || ""),
+        mcpServers: Array.isArray(parsed.mcpServers) ? parsed.mcpServers : [],
+        activeMapping: parsed.activeMapping || null,
+        activeFindMapping: parsed.activeFindMapping || null
+      };
+    } catch (e) {
+      console.error("Failed to load chat settings:", e);
+      return defaultChatSettings();
+    }
+  }
+
+  function saveChatSettings(settings) {
+    localStorage.setItem(CHAT_SETTINGS_KEY, JSON.stringify(settings));
+  }
+
+  function showSettingsFeedback(message) {
+    if (!settingsSaveFeedback) return;
+    settingsSaveFeedback.textContent = message;
+    settingsSaveFeedback.classList.add("visible");
+    if (settingsFeedbackTimer) {
+      clearTimeout(settingsFeedbackTimer);
+    }
+    settingsFeedbackTimer = setTimeout(() => {
+      settingsSaveFeedback.classList.remove("visible");
+      settingsSaveFeedback.textContent = "";
+    }, 2200);
+  }
+
+  function generateSettingsId(prefix = "srv") {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function isValidMcpServerName(name) {
+    return /^[A-Za-z][A-Za-z0-9_-]*$/.test(name || "");
+  }
+
+  function getMcpServerNameError(name) {
+    if (!name) return "Укажите имя MCP сервера.";
+    if (!isValidMcpServerName(name)) {
+      return "Имя MCP сервера: только латиница, цифры, _ и -, первый символ — буква.";
+    }
+    return "";
+  }
+
+  function normalizeMcpUrl(url) {
+    return String(url || "").trim().replace(/\/+$/, "");
+  }
+
+  function findDuplicateMcpServer(settings, { name = "", url = "", excludeId = "" }) {
+    const normalizedName = String(name || "").trim().toLowerCase();
+    const normalizedUrl = normalizeMcpUrl(url).toLowerCase();
+    return (settings.mcpServers || []).find(server => {
+      if (server.id === excludeId) return false;
+      const serverName = String(server.name || "").trim().toLowerCase();
+      const serverUrl = normalizeMcpUrl(server.url).toLowerCase();
+      return (normalizedName && serverName === normalizedName) || (normalizedUrl && serverUrl === normalizedUrl);
+    }) || null;
+  }
+
+  function setMcpFormError(message, field = "") {
+    if (!mcpServerFormError) return;
+    mcpServerFormError.textContent = message || "";
+    mcpServerFormError.hidden = !message;
+    mcpServerNameInput.classList.toggle("settings-input-error", !!message && field === "name");
+    mcpServerUrlInput.classList.toggle("settings-input-error", !!message && field === "url");
+  }
+
+  function setMcpActiveToolError(message) {
+    if (!mcpActiveToolError) return;
+    if (mcpActiveToolErrorText) {
+      mcpActiveToolErrorText.textContent = message || "";
+    } else {
+      mcpActiveToolError.textContent = message || "";
+    }
+    mcpActiveToolError.hidden = !message;
+  }
+
+  async function loadChatCapabilities() {
+    try {
+      const response = await fetch("/chat/api/config");
+      if (response.ok) {
+        chatCapabilities = { ...chatCapabilities, ...(await response.json()) };
+      }
+    } catch (error) {
+      console.warn("Failed to load chat capabilities:", error);
+    }
+  }
+
+  function applySettingsCapabilityState() {
+    const instructionsEnabled = !!chatCapabilities.custom_instructions_enabled;
+    const mcpEnabled = !!chatCapabilities.custom_mcp_enabled;
+    settingsBtn.hidden = !instructionsEnabled && !mcpEnabled;
+    instructionsDisabled.hidden = instructionsEnabled;
+    mcpDisabled.hidden = mcpEnabled;
+    workspaceInstructionsInput.disabled = !instructionsEnabled;
+    mcpServerNameInput.disabled = !mcpEnabled;
+    mcpServerUrlInput.disabled = !mcpEnabled;
+    mcpAddServerBtn.disabled = !mcpEnabled;
+    mcpActiveToolSelect.disabled = !mcpEnabled;
+    mcpActiveFindToolSelect.disabled = !mcpEnabled;
+  }
+
+  function openSettingsModal(tab = "instructions") {
+    renderSettingsModal();
+    setSettingsTab(tab);
+    settingsModal.classList.remove("hidden");
+  }
+
+  function closeSettingsModal() {
+    settingsModal.classList.add("hidden");
+  }
+
+  function setSettingsTab(tab) {
+    currentSettingsTab = tab;
+    settingsTabs.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tab));
+    document.getElementById("settings-tab-instructions").classList.toggle("active", tab === "instructions");
+    document.getElementById("settings-tab-mcp").classList.toggle("active", tab === "mcp");
+    updateSettingsActionHints();
+  }
+
+  function updateSettingsActionHints() {
+    instructionsSaveBtn.title = "Сохранить настройки";
+    settingsExportBtn.title = "Экспортировать все настройки в JSON-файл";
+    settingsImportBtn.title = "Импортировать настройки из JSON-файла";
+    settingsFooterCloseBtn.title = "Закрыть окно настроек";
+    instructionsResetBtn.title = currentSettingsTab === "mcp"
+      ? "Сбросить настройки вкладки «MCP сервера»: серверы, инструменты и активные инструменты"
+      : "Сбросить настройки вкладки «Инструкции»: инструкции рабочего пространства";
+  }
+
+  function saveCurrentSettings() {
+    const settings = loadChatSettings();
+    settings.workspaceInstructions = workspaceInstructionsInput.value
+      .slice(0, chatCapabilities.custom_instructions_max_length || 4000);
+    saveChatSettings(settings);
+    showSettingsFeedback("Настройки сохранены");
+    setStatus("Настройки сохранены");
+  }
+
+  function hasUnsavedSettings() {
+    const settings = loadChatSettings();
+    const currentInstructions = workspaceInstructionsInput.value
+      .slice(0, chatCapabilities.custom_instructions_max_length || 4000);
+    return currentInstructions !== (settings.workspaceInstructions || "");
+  }
+
+  function showUnsavedSettingsDialog() {
+    return new Promise(resolve => {
+      const overlay = document.createElement("div");
+      overlay.className = "settings-confirm-backdrop";
+
+      const dialog = document.createElement("div");
+      dialog.className = "settings-confirm-dialog";
+
+      const title = document.createElement("div");
+      title.className = "settings-confirm-title";
+      title.textContent = "Есть несохраненные изменения";
+
+      const text = document.createElement("div");
+      text.className = "settings-confirm-text";
+      text.textContent = "Сохранить изменения перед закрытием?";
+
+      const actions = document.createElement("div");
+      actions.className = "settings-confirm-actions";
+
+      const yes = document.createElement("button");
+      yes.className = "settings-action-primary";
+      yes.textContent = "Да";
+
+      const no = document.createElement("button");
+      no.className = "settings-action-warn";
+      no.textContent = "Нет";
+
+      const cancel = document.createElement("button");
+      cancel.className = "settings-action-neutral";
+      cancel.textContent = "Отмена";
+
+      const close = value => {
+        overlay.remove();
+        resolve(value);
+      };
+
+      yes.addEventListener("click", () => close("save"));
+      no.addEventListener("click", () => close("discard"));
+      cancel.addEventListener("click", () => close("cancel"));
+      overlay.addEventListener("click", event => {
+        if (event.target === overlay) close("cancel");
+      });
+
+      actions.append(yes, no, cancel);
+      dialog.append(title, text, actions);
+      overlay.appendChild(dialog);
+      document.body.appendChild(overlay);
+      cancel.focus();
+    });
+  }
+
+  async function requestCloseSettingsModal() {
+    if (!hasUnsavedSettings()) {
+      closeSettingsModal();
+      return;
+    }
+    const choice = await showUnsavedSettingsDialog();
+    if (choice === "save") {
+      saveCurrentSettings();
+      closeSettingsModal();
+    } else if (choice === "discard") {
+      renderSettingsModal();
+      closeSettingsModal();
+    }
+  }
+
+  function renderSettingsModal() {
+    const settings = loadChatSettings();
+    workspaceInstructionsInput.value = settings.workspaceInstructions || "";
+    applySettingsCapabilityState();
+    renderMcpServers(settings);
+    renderMcpMapping(settings);
+  }
+
+  function renderMcpServers(settings) {
+    mcpServersList.innerHTML = "";
+    if (!settings.mcpServers.length) {
+      const empty = document.createElement("div");
+      empty.className = "settings-hint";
+      empty.textContent = "MCP-серверы не настроены.";
+      mcpServersList.appendChild(empty);
+      return;
+    }
+
+    settings.mcpServers.forEach(server => {
+      const card = document.createElement("div");
+      card.className = "mcp-server-card";
+      card.dataset.serverId = server.id;
+
+      const head = document.createElement("div");
+      head.className = "mcp-server-head";
+
+      const tools = Array.isArray(server.tools) ? server.tools : [];
+      const toggleTools = document.createElement("button");
+      toggleTools.type = "button";
+      toggleTools.className = "mcp-tools-toggle";
+      toggleTools.textContent = server.toolsCollapsed === false ? "−" : "+";
+      toggleTools.title = server.toolsCollapsed === false ? "Скрыть инструменты" : "Показать инструменты";
+      toggleTools.setAttribute("aria-expanded", String(server.toolsCollapsed === false));
+      toggleTools.disabled = !tools.length;
+      toggleTools.addEventListener("click", () => {
+        server.toolsCollapsed = server.toolsCollapsed === false;
+        saveChatSettings(settings);
+        renderSettingsModal();
+      });
+
+      const enabled = document.createElement("input");
+      enabled.type = "checkbox";
+      enabled.checked = server.enabled !== false;
+      enabled.title = "Включить сервер";
+      enabled.addEventListener("change", () => {
+        server.enabled = enabled.checked;
+        saveChatSettings(settings);
+        renderSettingsModal();
+      });
+
+      const name = document.createElement("input");
+      name.type = "text";
+      name.value = server.name || "";
+      name.placeholder = "server_name";
+      name.pattern = "[A-Za-z][A-Za-z0-9_-]*";
+      name.title = "Латиница, цифры, _ и -. Первый символ — буква.";
+      name.addEventListener("change", () => {
+        const nextName = name.value.trim();
+        const error = getMcpServerNameError(nextName);
+        if (error) {
+          name.classList.add("settings-input-error");
+          name.value = server.name || "";
+          setStatus(error);
+          return;
+        }
+        const duplicate = findDuplicateMcpServer(settings, { name: nextName, excludeId: server.id });
+        if (duplicate) {
+          const message = "MCP сервер с таким именем уже добавлен.";
+          name.classList.add("settings-input-error");
+          name.value = server.name || "";
+          setStatus(message);
+          return;
+        }
+        name.classList.remove("settings-input-error");
+        server.name = nextName;
+        saveChatSettings(settings);
+        renderSettingsModal();
+      });
+
+      const url = document.createElement("input");
+      url.type = "url";
+      url.value = server.url || "";
+      url.placeholder = "http://192.168.0.1:6003/mcp";
+      url.addEventListener("change", () => {
+        const nextUrl = url.value.trim();
+        const duplicate = findDuplicateMcpServer(settings, { url: nextUrl, excludeId: server.id });
+        if (duplicate) {
+          const message = "MCP сервер с таким URL уже добавлен.";
+          url.classList.add("settings-input-error");
+          url.value = server.url || "";
+          setStatus(message);
+          return;
+        }
+        url.classList.remove("settings-input-error");
+        server.url = nextUrl;
+        saveChatSettings(settings);
+      });
+
+      const refresh = document.createElement("button");
+      refresh.type = "button";
+      refresh.className = "settings-action-info";
+      refresh.title = "Обновить инструменты MCP сервера";
+      refresh.innerHTML = '<span class="settings-btn-icon">⟳</span> Обновить';
+      refresh.addEventListener("click", () => {
+        refreshSingleMcpServerTools(server.id);
+      });
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "settings-action-danger";
+      remove.innerHTML = '<span class="settings-btn-icon">×</span> Удалить';
+      remove.addEventListener("click", () => {
+        const next = loadChatSettings();
+        next.mcpServers = next.mcpServers.filter(item => item.id !== server.id);
+        if (next.activeMapping && next.activeMapping.server_id === server.id) {
+          next.activeMapping = null;
+        }
+        if (next.activeFindMapping && next.activeFindMapping.server_id === server.id) {
+          next.activeFindMapping = null;
+        }
+        saveChatSettings(next);
+        renderSettingsModal();
+      });
+
+      head.append(toggleTools, enabled, name, url, refresh, remove);
+      card.appendChild(head);
+
+      if (server.error) {
+        const err = document.createElement("div");
+        err.className = "mcp-server-error";
+        err.textContent = server.error;
+        card.appendChild(err);
+      }
+
+      if (tools.length && server.toolsCollapsed === false) {
+        const list = document.createElement("div");
+        list.className = "mcp-tools-list";
+        tools.forEach(tool => {
+          const label = document.createElement("label");
+          label.className = "mcp-tool-item";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = tool.enabled !== false;
+          cb.addEventListener("change", () => {
+            tool.enabled = cb.checked;
+            const active = settings.activeMapping;
+            if (active && active.server_id === server.id && active.tool_name === tool.name && !tool.enabled) {
+              settings.activeMapping = null;
+            }
+            const activeFind = settings.activeFindMapping;
+            if (activeFind && activeFind.server_id === server.id && activeFind.tool_name === tool.name && !tool.enabled) {
+              settings.activeFindMapping = null;
+            }
+            saveChatSettings(settings);
+            renderMcpMapping(settings);
+          });
+          label.title = tool.description || tool.name;
+          label.append(cb, document.createTextNode(" " + tool.name));
+          list.appendChild(label);
+        });
+        card.appendChild(list);
+      }
+
+      mcpServersList.appendChild(card);
+    });
+  }
+
+  function getEnabledMcpToolOptions(settings) {
+    const options = [];
+    settings.mcpServers.forEach(server => {
+      if (server.enabled === false) return;
+      (server.tools || []).forEach(tool => {
+        if (tool.enabled === false) return;
+        options.push({ server, tool });
+      });
+    });
+    return options;
+  }
+
+  function renderMcpMapping(settings) {
+    const options = getEnabledMcpToolOptions(settings);
+    renderMcpMappingSelect(options, settings.activeMapping || {}, mcpActiveToolSelect, mcpActiveToolName);
+    renderMcpMappingSelect(options, settings.activeFindMapping || {}, mcpActiveFindToolSelect, mcpActiveFindToolName);
+  }
+
+  function renderMcpMappingSelect(options, active, selectEl, nameEl) {
+    selectEl.innerHTML = "";
+
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "Не выбрано";
+    selectEl.appendChild(empty);
+
+    options.forEach(({ server, tool }) => {
+      const opt = document.createElement("option");
+      opt.value = `${server.id}::${tool.name}`;
+      opt.textContent = `${server.name || server.id} / ${tool.name}`;
+      opt.selected = active.server_id === server.id && active.tool_name === tool.name;
+      selectEl.appendChild(opt);
+    });
+
+    const selected = options.find(({ server, tool }) => active.server_id === server.id && active.tool_name === tool.name);
+    nameEl.textContent = selected
+      ? `Итоговое имя: ${(selected.server.name || selected.server.id)}__${selected.tool.name}`
+      : "Инструмент не выбран.";
+  }
+
+  function sameMcpMapping(left, right) {
+    return !!left && !!right && left.server_id === right.server_id && left.tool_name === right.tool_name;
+  }
+
+  async function refreshMcpTools() {
+    if (!chatCapabilities.custom_mcp_enabled) {
+      setStatus("MCP отключен на сервере");
+      return;
+    }
+    const settings = loadChatSettings();
+    setStatus("Обновление MCP tools...", true);
+    try {
+      const response = await fetch("/chat/api/mcp/list-tools", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ servers: settings.mcpServers })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      const byId = new Map((data.servers || []).map(server => [server.id, server]));
+      settings.mcpServers = settings.mcpServers.map(server => {
+        const next = byId.get(server.id);
+        if (!next) return server;
+        const oldTools = new Map((server.tools || []).map(tool => [tool.name, tool]));
+        return {
+          ...server,
+          error: next.error || null,
+          tools: (next.tools || []).map(tool => ({
+            name: tool.name,
+            description: tool.description || "",
+            inputSchema: tool.inputSchema || null,
+            enabled: oldTools.get(tool.name)?.enabled !== false
+          }))
+        };
+      });
+      saveChatSettings(settings);
+      renderSettingsModal();
+      setStatus("MCP tools обновлены");
+    } catch (error) {
+      console.error(error);
+      setStatus("Ошибка обновления MCP tools");
+    }
+  }
+
+  async function refreshSingleMcpServerTools(serverId) {
+    if (!chatCapabilities.custom_mcp_enabled) {
+      setStatus("MCP отключен на сервере");
+      return;
+    }
+    const settings = loadChatSettings();
+    const server = settings.mcpServers.find(item => item.id === serverId);
+    if (!server) return;
+    setStatus("Обновление MCP tools...", true);
+    try {
+      const response = await fetch("/chat/api/mcp/list-tools", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ servers: [server] })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      const updated = (data.servers || [])[0];
+      const latest = loadChatSettings();
+      latest.mcpServers = latest.mcpServers.map(item => {
+        if (item.id !== serverId || !updated) return item;
+        const oldTools = new Map((item.tools || []).map(tool => [tool.name, tool]));
+        return {
+          ...item,
+          error: updated.error || null,
+          toolsCollapsed: false,
+          tools: (updated.tools || []).map(tool => ({
+            name: tool.name,
+            description: tool.description || "",
+            inputSchema: tool.inputSchema || null,
+            enabled: oldTools.get(tool.name)?.enabled !== false
+          }))
+        };
+      });
+      saveChatSettings(latest);
+      renderSettingsModal();
+      const added = updated?.tools?.length || 0;
+      setStatus(added ? `MCP tools обновлены: ${added}` : "MCP tools не найдены");
+    } catch (error) {
+      console.error(error);
+      const latest = loadChatSettings();
+      latest.mcpServers = latest.mcpServers.map(item => (
+        item.id === serverId
+          ? { ...item, toolsCollapsed: false, error: String(error.message || error) }
+          : item
+      ));
+      saveChatSettings(latest);
+      renderSettingsModal();
+      setStatus("Ошибка обновления MCP tools");
+    }
+  }
+
+  function exportChatSettings() {
+    const blob = new Blob([JSON.stringify(loadChatSettings(), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `1c-chat-settings-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function importChatSettings(file) {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.mcpServers)) {
+      throw new Error("Некорректный файл настроек");
+    }
+    const invalidServer = parsed.mcpServers.find(server => !isValidMcpServerName(String(server?.name || "")));
+    if (invalidServer) {
+      throw new Error("В файле есть MCP сервер с некорректным именем");
+    }
+    if (!confirm("Заменить текущие настройки импортированными?")) return;
+    saveChatSettings({
+      workspaceInstructions: String(parsed.workspaceInstructions || ""),
+      mcpServers: parsed.mcpServers,
+      activeMapping: parsed.activeMapping || null,
+      activeFindMapping: parsed.activeFindMapping || null
+    });
+    renderSettingsModal();
+  }
+
+  function buildStreamCustomization() {
+    const settings = loadChatSettings();
+    const body = {};
+    if (chatCapabilities.custom_instructions_enabled && settings.workspaceInstructions.trim()) {
+      body.workspace_instructions = settings.workspaceInstructions
+        .slice(0, chatCapabilities.custom_instructions_max_length || 4000);
+    }
+    if (chatCapabilities.custom_mcp_enabled) {
+      body.mcp_config = {
+        servers: settings.mcpServers.slice(0, chatCapabilities.custom_mcp_max_servers || 10).map(server => ({
+          id: server.id,
+          name: isValidMcpServerName(server.name) ? server.name : server.id,
+          url: server.url,
+          enabled: server.enabled !== false,
+          tools: (server.tools || []).map(tool => ({
+            name: tool.name,
+            enabled: tool.enabled !== false
+          }))
+        }))
+      };
+      if (settings.activeMapping) {
+        body.active_mcp_mapping = settings.activeMapping;
+      }
+      if (settings.activeFindMapping) {
+        body.active_mcp_find_mapping = settings.activeFindMapping;
+      }
+    }
+    return body;
+  }
 
   // Mermaid initialization and rendering
   function initMermaid() {
@@ -341,7 +976,7 @@
     chatEl.innerHTML = "";
     currentAssistantBubble = null;
     for (const m of arr) {
-      appendMessage(m.role, m.text, false, m.ts, m.tokens, m.files, m.message_id, m.feedback_score, m.reasoning, m.tool_calls);
+      appendMessage(m.role, m.text, false, m.ts, m.tokens, m.files, m.message_id, m.reasoning, m.tool_calls);
     }
   }
 
@@ -478,7 +1113,7 @@
     }
   }
 
-  function appendMessage(role, text, append = false, ts = null, tokens = null, files = null, messageId = null, feedbackScore = null, reasoning = null, toolCalls = null) {
+  function appendMessage(role, text, append = false, ts = null, tokens = null, files = null, messageId = null, reasoning = null, toolCalls = null) {
     let bubbleWrap = null;
     let createdNow = false;
 
@@ -530,44 +1165,6 @@
         });
         bubble.appendChild(copyBtn);
 
-        // Add feedback buttons for assistant messages
-        const feedbackContainer = document.createElement("div");
-        feedbackContainer.className = "feedback-buttons";
-
-        const likeBtn = document.createElement("button");
-        likeBtn.className = "feedback-btn like-btn";
-        likeBtn.title = "Ответ помог";
-        likeBtn.innerHTML = "👍";
-
-        const dislikeBtn = document.createElement("button");
-        dislikeBtn.className = "feedback-btn dislike-btn";
-        dislikeBtn.title = "Ответ не помог";
-        dislikeBtn.innerHTML = "👎";
-
-        likeBtn.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          const messageId = bubbleWrap.dataset.messageId;
-          if (!messageId) {
-            console.warn("Message ID not found for feedback");
-            return;
-          }
-          await sendFeedback(messageId, 1, likeBtn, dislikeBtn, bubbleWrap);
-        });
-
-        dislikeBtn.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          const messageId = bubbleWrap.dataset.messageId;
-          if (!messageId) {
-            console.warn("Message ID not found for feedback");
-            return;
-          }
-          await sendFeedback(messageId, -1, likeBtn, dislikeBtn, bubbleWrap);
-        });
-
-        feedbackContainer.appendChild(likeBtn);
-        feedbackContainer.appendChild(dislikeBtn);
-        bubble.appendChild(feedbackContainer);
-
         // Add token info button for assistant messages
         const tokenBtn = document.createElement("button");
         tokenBtn.className = "token-btn";
@@ -618,25 +1215,6 @@
           bubbleWrap.dataset.messageId = messageId;
         }
 
-        // Restore feedback state if provided (from history)
-        if (feedbackScore !== null && feedbackScore !== undefined) {
-          bubbleWrap.dataset.feedbackScore = feedbackScore;
-
-          // Update button states to show which was clicked
-          const feedbackButtons = bubble.querySelector(".feedback-buttons");
-          if (feedbackButtons) {
-            const likeBtn = feedbackButtons.querySelector(".like-btn");
-            const dislikeBtn = feedbackButtons.querySelector(".dislike-btn");
-
-            if (feedbackScore === 1) {
-              likeBtn.classList.add("active");
-              dislikeBtn.classList.remove("active");
-            } else if (feedbackScore === -1) {
-              dislikeBtn.classList.add("active");
-              likeBtn.classList.remove("active");
-            }
-          }
-        }
       }
 
       // Separate content/meta containers (meta holds timestamp)
@@ -1044,6 +1622,9 @@
   }
 
   // Initialize UI state
+  loadChatCapabilities().then(() => {
+    applySettingsCapabilityState();
+  });
   const activeConv = conversationsManager.getActive();
   if (activeConv) {
     convId = activeConv.conversation_id || "";
@@ -1220,6 +1801,146 @@
         el.outerHTML = el.textContent;
       });
     }
+  });
+
+  // Settings handlers
+  settingsBtn.addEventListener("click", () => openSettingsModal("instructions"));
+  settingsCloseBtn.addEventListener("click", requestCloseSettingsModal);
+  settingsFooterCloseBtn.addEventListener("click", requestCloseSettingsModal);
+  settingsModal.addEventListener("click", (e) => {
+    if (e.target === settingsModal) requestCloseSettingsModal();
+  });
+  settingsTabs.forEach(btn => {
+    btn.addEventListener("click", () => setSettingsTab(btn.dataset.tab));
+  });
+  instructionsSaveBtn.addEventListener("click", () => {
+    saveCurrentSettings();
+  });
+  instructionsResetBtn.addEventListener("click", () => {
+    const settings = loadChatSettings();
+    if (currentSettingsTab === "mcp") {
+      if (!confirm("Сбросить MCP настройки?")) return;
+      settings.mcpServers = [];
+      settings.activeMapping = null;
+      settings.activeFindMapping = null;
+      saveChatSettings(settings);
+      renderSettingsModal();
+      return;
+    }
+    settings.workspaceInstructions = "";
+    saveChatSettings(settings);
+    renderSettingsModal();
+  });
+  settingsExportBtn.addEventListener("click", exportChatSettings);
+  settingsImportBtn.addEventListener("click", () => settingsImportFile.click());
+  settingsImportFile.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      await importChatSettings(file);
+      setStatus("Настройки импортированы");
+    } catch (error) {
+      console.error(error);
+      setStatus("Ошибка импорта настроек");
+    }
+  });
+  mcpAddServerBtn.addEventListener("click", () => {
+    const name = (mcpServerNameInput.value || "").trim();
+    const url = (mcpServerUrlInput.value || "").trim();
+    const settings = loadChatSettings();
+    const nameError = getMcpServerNameError(name);
+    if (nameError) {
+      setMcpFormError(nameError, "name");
+      mcpServerNameInput.focus();
+      setStatus(nameError);
+      return;
+    }
+    if (!url) {
+      const message = "Укажите URL MCP сервера.";
+      setMcpFormError(message, "url");
+      mcpServerUrlInput.focus();
+      setStatus(message);
+      return;
+    }
+    const duplicate = findDuplicateMcpServer(settings, { name, url });
+    if (duplicate) {
+      const sameName = String(duplicate.name || "").trim().toLowerCase() === name.toLowerCase();
+      const message = sameName
+        ? "MCP сервер с таким именем уже добавлен."
+        : "MCP сервер с таким URL уже добавлен.";
+      setMcpFormError(message, sameName ? "name" : "url");
+      (sameName ? mcpServerNameInput : mcpServerUrlInput).focus();
+      setStatus(message);
+      return;
+    }
+    const maxServers = chatCapabilities.custom_mcp_max_servers || 10;
+    if (settings.mcpServers.length >= maxServers) {
+      setStatus(`Лимит MCP серверов: ${maxServers}`);
+      return;
+    }
+    setMcpFormError("");
+    const serverId = generateSettingsId("mcp");
+    settings.mcpServers.push({
+      id: serverId,
+      name,
+      url,
+      enabled: true,
+      tools: [],
+      toolsCollapsed: false
+    });
+    saveChatSettings(settings);
+    mcpServerNameInput.value = "";
+    mcpServerUrlInput.value = "";
+    renderSettingsModal();
+    refreshSingleMcpServerTools(serverId);
+  });
+  mcpServerNameInput.addEventListener("input", () => setMcpFormError(""));
+  mcpServerUrlInput.addEventListener("input", () => setMcpFormError(""));
+  mcpActiveToolErrorClose.addEventListener("click", () => setMcpActiveToolError(""));
+  mcpActiveToolSelect.addEventListener("change", () => {
+    const settings = loadChatSettings();
+    const value = mcpActiveToolSelect.value;
+    if (!value) {
+      settings.activeMapping = null;
+      setMcpActiveToolError("");
+    } else {
+      const [serverId, toolName] = value.split("::");
+      const nextMapping = { server_id: serverId, tool_name: toolName };
+      if (sameMcpMapping(nextMapping, settings.activeFindMapping)) {
+        const message = "Этот инструмент уже выбран во втором активном слоте.";
+        setMcpActiveToolError(message);
+        setStatus("Этот инструмент уже выбран.");
+        renderMcpMapping(settings);
+        return;
+      }
+      setMcpActiveToolError("");
+      settings.activeMapping = nextMapping;
+    }
+    saveChatSettings(settings);
+    renderMcpMapping(settings);
+  });
+  mcpActiveFindToolSelect.addEventListener("change", () => {
+    const settings = loadChatSettings();
+    const value = mcpActiveFindToolSelect.value;
+    if (!value) {
+      settings.activeFindMapping = null;
+      setMcpActiveToolError("");
+    } else {
+      const [serverId, toolName] = value.split("::");
+      const nextMapping = { server_id: serverId, tool_name: toolName };
+      if (sameMcpMapping(nextMapping, settings.activeMapping)) {
+        const message = "Этот инструмент уже выбран в первом активном слоте.";
+        setMcpActiveToolError(message);
+        setStatus("Этот инструмент уже выбран.");
+        renderMcpMapping(settings);
+        return;
+      }
+      setMcpActiveToolError("");
+      settings.activeFindMapping = nextMapping;
+    }
+    saveChatSettings(settings);
+    renderMcpMapping(settings);
   });
 
   // Store original HTML to restore later
@@ -1422,45 +2143,6 @@
     }
   });
 
-  async function sendFeedback(messageId, score, likeBtn, dislikeBtn, bubbleWrap) {
-    try {
-      const response = await fetch("/chat/api/feedback", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({message_id: messageId, score: score})
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || "Failed to send feedback");
-      }
-
-      // Visual feedback - показываем какая кнопка активна
-      if (score === 1) {
-        likeBtn.classList.add("active");
-        dislikeBtn.classList.remove("active");
-      } else {
-        dislikeBtn.classList.add("active");
-        likeBtn.classList.remove("active");
-      }
-
-      // Save feedback score to bubble dataset and history
-      bubbleWrap.dataset.feedbackScore = score;
-
-      // Update history with feedback
-      const history = loadHistory();
-      const messageIndex = history.findIndex(msg => msg.message_id === messageId);
-      if (messageIndex !== -1) {
-        history[messageIndex].feedback_score = score;
-        saveHistory(history);
-      }
-
-    } catch (error) {
-      console.error("Feedback error:", error);
-      alert("Ошибка отправки отзыва: " + error.message);
-    }
-  }
-
   // Creates a reasoning block inside bubbleWrap and fills it with text
   function _renderReasoningBlock(bubbleWrap, text, open = true) {
     const bubble = bubbleWrap.querySelector(".bubble");
@@ -1523,7 +2205,8 @@
       conversation_id: convId || null,
       create_new_session: forceNewSession || !convId,
       programming_language: null,
-      parent_uuid: parentUuid
+      parent_uuid: parentUuid,
+      ...buildStreamCustomization()
     };
     forceNewSession = false;
 
@@ -1637,7 +2320,6 @@
         }
         appendMessage("assistant", d.text || "", true);
 
-        // Store message_id in current assistant bubble for feedback
         if (d.message_id && currentAssistantBubble) {
           currentAssistantBubble.dataset.messageId = d.message_id;
         }
@@ -1730,9 +2412,7 @@
             total_tokens: parseInt(currentAssistantBubble.dataset.totalTokens || 0)
           };
 
-          // Get message_id and feedback_score from dataset
           const messageId = currentAssistantBubble.dataset.messageId;
-          const feedbackScore = currentAssistantBubble.dataset.feedbackScore;
 
           // Collapse reasoning and tool-call blocks after stream completes
           if (currentAssistantBubble) {
@@ -1751,8 +2431,7 @@
             ts: ts3,
             convId,
             tokens: tokens,
-            message_id: messageId,
-            feedback_score: feedbackScore ? parseInt(feedbackScore) : undefined
+            message_id: messageId
           });
 
           // Update conversations list to reflect new message count and time

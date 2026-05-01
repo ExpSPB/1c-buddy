@@ -19,6 +19,14 @@ from .onec_models import (
     ToolResultItem,
     ToolResultRequest,
 )
+from .chat_custom_tools import (
+    INSTRUCTION_CARRIER_NAME,
+    MCP_FIND_MAPPING_TOOL_NAME,
+    MCP_MAPPING_TOOL_NAME,
+    McpToolSnapshot,
+    call_mcp_tool,
+    mcp_result_to_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +132,14 @@ class OneCApiClient:
             raise ApiError(f"Unexpected error creating conversation: {str(e)}")
 
     async def iter_message_stream(
-        self, conversation_id: str, message: str, parent_uuid: Optional[str] = None
+        self,
+        conversation_id: str,
+        message: str,
+        parent_uuid: Optional[str] = None,
+        *,
+        extra_tools: Optional[list[dict[str, Any]]] = None,
+        mcp_snapshot: Optional[McpToolSnapshot] = None,
+        mcp_snapshots: Optional[dict[str, McpToolSnapshot]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Send a message and yield streaming updates.
@@ -158,9 +173,13 @@ class OneCApiClient:
             # First payload: user message
             request_data = MessageRequest.from_instruction(message, parent_uuid=parent_uuid)
             payload = request_data.model_dump()
+            if extra_tools:
+                payload.setdefault("content", {}).setdefault("tools", [])
+                payload["content"]["tools"] = list(extra_tools)
 
             # last_sent_tool_calls хранится МЕЖДУ итерациями while — для per-item fallback
             last_sent_tool_calls: list = []
+            displayed_mapped_tool_results: set[str] = set()
             assistant_segments: list[str] = []
             visible_text = ""
 
@@ -183,6 +202,26 @@ class OneCApiClient:
                     return build_visible_text("")
                 assistant_segments.append(segment)
                 return build_visible_text("")
+
+            def get_mapped_snapshot(tool_name: str) -> Optional[McpToolSnapshot]:
+                snapshot = (mcp_snapshots or {}).get(tool_name)
+                if not snapshot and mcp_snapshot and tool_name == MCP_MAPPING_TOOL_NAME:
+                    snapshot = mcp_snapshot
+                return snapshot
+
+            def format_mapped_request_markdown(snapshot: McpToolSnapshot, func: dict[str, Any]) -> str:
+                raw_args = func.get("arguments") or "{}"
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    parsed_args = raw_args
+                if isinstance(parsed_args, (dict, list)):
+                    args_text = json.dumps(parsed_args, ensure_ascii=False, indent=2)
+                else:
+                    args_text = str(parsed_args or "")
+                if not args_text:
+                    return f"Выполняем **{snapshot.upstream_name}**"
+                return f"Выполняем **{snapshot.upstream_name}**\n\n```json\n{args_text}\n```"
 
             while True:
                 if logger.isEnabledFor(logging.DEBUG):
@@ -241,6 +280,8 @@ class OneCApiClient:
                                 }
                                 for tc in last_sent_tool_calls:
                                     tc_id = tc.get("id", "")
+                                    if tc_id in displayed_mapped_tool_results:
+                                        continue
                                     ri = ri_by_id.get(tc_id, {})
                                     func = tc.get("function", {})
                                     yield {
@@ -357,12 +398,18 @@ class OneCApiClient:
                                         tc_id = tc.get("id", "")
                                         ri = ri_by_id.get(tc_id, {})
                                         func = tc.get("function", {})
-                                        req_md = (ri.get("request_markdown") or
-                                                  f"`{func.get('name', '?')}({func.get('arguments', '')})`")
+                                        mapped_snapshot = get_mapped_snapshot(func.get("name", ""))
+                                        if mapped_snapshot:
+                                            display_tool_name = mapped_snapshot.upstream_name
+                                            req_md = format_mapped_request_markdown(mapped_snapshot, func)
+                                        else:
+                                            display_tool_name = ri.get("tool_name") or func.get("name", "")
+                                            req_md = (ri.get("request_markdown") or
+                                                      f"`{func.get('name', '?')}({func.get('arguments', '')})`")
                                         yield {
                                             "tool_call": {
                                                 "tool_call_id": tc_id,
-                                                "tool_name": ri.get("tool_name") or func.get("name", ""),
+                                                "tool_name": display_tool_name,
                                                 "request_markdown": req_md,
                                             }
                                         }
@@ -399,9 +446,15 @@ class OneCApiClient:
                 # Сохраняем ДО очистки — нужны для fallback в следующем round-trip
                 last_sent_tool_calls = list(tool_calls_pending)
                 # Подготавливаем tool result POST
-                payload = self._build_tool_result_payload(
-                    tool_calls_pending, session.last_message_uuid
+                payload, ui_tool_results = await self._build_tool_result_payload(
+                    tool_calls_pending,
+                    session.last_message_uuid,
+                    mcp_snapshot=mcp_snapshot,
+                    mcp_snapshots=mcp_snapshots,
                 )
+                for ui_result in ui_tool_results:
+                    displayed_mapped_tool_results.add(ui_result["tool_result"]["tool_call_id"])
+                    yield ui_result
                 tool_calls_pending = []
 
         except httpx.RequestError as e:
@@ -419,43 +472,104 @@ class OneCApiClient:
             final_text = update.get("text") or final_text
         return (final_text or "").strip()
 
-    async def send_feedback(self, message_id: str, score: int) -> None:
-        """
-        Send feedback (like/dislike) for a message.
-
-        Args:
-            message_id: Message UUID (format: "conversation_id:message_hash")
-            score: 1 for like, -1 for dislike
-        """
-        try:
-            url = f"{self.base_url}/chat_api/v1/feedbacks/{message_id}/like"
-
-            logger.info(f"Sending feedback: message_id={message_id}, score={score}")
-
-            resp = await self.client.post(url, json={"score": score})
-
-            # Accept both 200 OK and 204 No Content as success
-            if resp.status_code not in (200, 204):
-                raise ApiError(
-                    f"Feedback error: {resp.status_code}", resp.status_code
-                )
-
-            logger.info(f"Feedback sent successfully: message_id={message_id}, score={score}")
-
-        except httpx.RequestError as e:
-            raise ApiError(f"Network error sending feedback: {str(e)}")
-        except ApiError:
-            raise
-        except Exception as e:
-            raise ApiError(f"Unexpected error sending feedback: {str(e)}")
-
-    def _build_tool_result_payload(
-        self, tool_calls: list[dict], parent_uuid: str
-    ) -> dict[str, Any]:
-        """Build upstream role=tool payload that confirms server-side tool execution."""
+    async def _build_tool_result_payload(
+        self,
+        tool_calls: list[dict],
+        parent_uuid: str,
+        mcp_snapshot: Optional[McpToolSnapshot] = None,
+        mcp_snapshots: Optional[dict[str, McpToolSnapshot]] = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Build upstream role=tool payload for server-side and client-side tools."""
         items = []
+        ui_results: list[dict[str, Any]] = []
         for tc in tool_calls:
             tool_call_id = tc.get("id", "")
+            func = tc.get("function") or {}
+            tool_name = func.get("name") or ""
+
+            mapped_snapshot = (mcp_snapshots or {}).get(tool_name)
+            if not mapped_snapshot and mcp_snapshot and tool_name == MCP_MAPPING_TOOL_NAME:
+                mapped_snapshot = mcp_snapshot
+
+            if tool_name in {MCP_MAPPING_TOOL_NAME, MCP_FIND_MAPPING_TOOL_NAME}:
+                if not mapped_snapshot:
+                    item = ToolResultItem(
+                        status="error",
+                        tool_call_id=tool_call_id,
+                        content="Active MCP mapping is not available.",
+                    )
+                    items.append(item)
+                    ui_results.append(
+                        {
+                            "tool_result": {
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "response_markdown": "Ошибка MCP инструмента: active mapping is not available.",
+                                "response_details": [],
+                                "hide_after": True,
+                            }
+                        }
+                    )
+                    continue
+
+                raw_args = func.get("arguments") or "{}"
+                try:
+                    arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    result = await call_mcp_tool(
+                        mapped_snapshot.server_url,
+                        mapped_snapshot.tool_name,
+                        arguments,
+                    )
+                    content = mcp_result_to_text(result)
+                    item = ToolResultItem(
+                        status="ok",
+                        tool_call_id=tool_call_id,
+                        content=content,
+                    )
+                    ui_results.append(
+                        {
+                            "tool_result": {
+                                "tool_call_id": tool_call_id,
+                                "tool_name": mapped_snapshot.upstream_name,
+                                "response_markdown": content,
+                                "response_details": [],
+                                "hide_after": True,
+                            }
+                        }
+                    )
+                except Exception as e:
+                    error_content = f"MCP tool error: {e}"
+                    item = ToolResultItem(
+                        status="error",
+                        tool_call_id=tool_call_id,
+                        content=error_content,
+                    )
+                    ui_results.append(
+                        {
+                            "tool_result": {
+                                "tool_call_id": tool_call_id,
+                                "tool_name": mapped_snapshot.upstream_name,
+                                "response_markdown": f"Ошибка MCP инструмента: {e}",
+                                "response_details": [],
+                                "hide_after": True,
+                            }
+                        }
+                    )
+                items.append(item)
+                continue
+
+            if tool_name == INSTRUCTION_CARRIER_NAME:
+                items.append(
+                    ToolResultItem(
+                        status="rejected",
+                        tool_call_id=tool_call_id,
+                        content="FormEdit is reserved for workspace instructions in this chat.",
+                    )
+                )
+                continue
+
             item = ToolResultItem(
                 status="accepted",
                 tool_call_id=tool_call_id,
@@ -464,7 +578,7 @@ class OneCApiClient:
             items.append(item)
 
         request = ToolResultRequest(parent_uuid=parent_uuid, content=items)
-        return request.model_dump()
+        return request.model_dump(), ui_results
 
     async def get_or_create_session(
         self, create_new: bool = False, programming_language: Optional[str] = None
